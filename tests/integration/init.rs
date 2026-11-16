@@ -553,6 +553,44 @@ mod test_descriptor {
             .stdout(predicate::str::contains("\"mnemonic\":"))
             .stdout(predicate::str::contains("\"fingerprint\":"));
     }
+
+    /// Asserts every public and private descriptor in `output` starts with `prefix`.
+    fn assert_descriptor_prefix(output: &[u8], prefix: &str) {
+        let json: serde_json::Value = serde_json::from_slice(output).expect("Invalid JSON");
+        for kind in ["public_descriptors", "private_descriptors"] {
+            for keychain in ["external", "internal"] {
+                let descriptor = json[kind][keychain].as_str().expect("Missing descriptor");
+                assert!(
+                    descriptor.starts_with(prefix),
+                    "{kind}.{keychain}: expected {prefix}..., got {descriptor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_wsh_descriptor_from_mnemonic() {
+        let temp_dir = TempDir::new().unwrap();
+        let cli = BdkCli::new("testnet", Some(temp_dir.path().to_path_buf()));
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let output = cli
+            .cmd("descriptor", &["--type", "wsh", mnemonic])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "descriptor command failed");
+        assert_descriptor_prefix(&output.stdout, "wsh(pk(");
+    }
+
+    #[test]
+    fn test_generate_descriptor_default_type_is_wsh() {
+        let temp_dir = TempDir::new().unwrap();
+        let cli = BdkCli::new("testnet", Some(temp_dir.path().to_path_buf()));
+
+        let output = cli.cmd("descriptor", &[]).output().unwrap();
+        assert!(output.status.success(), "descriptor command failed");
+        assert_descriptor_prefix(&output.stdout, "wsh(pk(");
+    }
 }
 
 // --- COMPILE COMMAND TESTS ---

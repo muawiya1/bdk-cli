@@ -33,7 +33,7 @@ use bdk_wallet::{
         Descriptor, Miniscript, Segwitv0, Terminal,
         descriptor::{DescriptorXKey, Wildcard},
     },
-    template::DescriptorTemplate,
+    template::{DescriptorTemplate, DescriptorTemplateOut},
 };
 
 use crate::error::BDKCliError as Error;
@@ -66,6 +66,34 @@ pub fn generate_descriptors(
     }
 }
 
+/// Single-key `wsh(pk(key/{0,1}/*))` descriptor template.
+///
+/// No BIP defines a derivation path for single-key P2WSH (BIP-48 and BIP-87
+/// are for multisig), and BDK has no `wsh` template. This uses the purpose-84
+/// path `m/84'/<coin>'/0'/{0,1}` to match how bdk-cli already derives `wsh`
+/// descriptors from public keys, so a mnemonic and its xpub produce the same
+/// descriptors.
+struct SingleKeyWsh(Xpriv, KeychainKind);
+
+impl DescriptorTemplate for SingleKeyWsh {
+    fn build(
+        self,
+        network: NetworkKind,
+    ) -> Result<DescriptorTemplateOut, bdk_wallet::descriptor::DescriptorError> {
+        let coin_type = match network {
+            NetworkKind::Main => 0u32,
+            _ => 1u32,
+        };
+        let branch = match self.1 {
+            KeychainKind::External => 0u32,
+            KeychainKind::Internal => 1u32,
+        };
+        let path = DerivationPath::from_str(&format!("m/84h/{coin_type}h/0h/{branch}"))
+            .map_err(bdk_wallet::descriptor::DescriptorError::Bip32)?;
+        bdk_wallet::descriptor!(wsh(pk((self.0, path))))
+    }
+}
+
 /// Generate descriptors from private key using BIP templates
 fn generate_private_descriptors(
     desc_type: &str,
@@ -81,7 +109,8 @@ fn generate_private_descriptors(
     let (external_desc, external_keymap, _) = match desc_type.to_lowercase().as_str() {
         "pkh" => Bip44(xprv, KeychainKind::External).build(network)?,
         "sh" => Bip49(xprv, KeychainKind::External).build(network)?,
-        "wpkh" | "wsh" => Bip84(xprv, KeychainKind::External).build(network)?,
+        "wpkh" => Bip84(xprv, KeychainKind::External).build(network)?,
+        "wsh" => SingleKeyWsh(xprv, KeychainKind::External).build(network)?,
         "tr" => Bip86(xprv, KeychainKind::External).build(network)?,
         _ => {
             return Err(Error::Generic(format!(
@@ -93,7 +122,8 @@ fn generate_private_descriptors(
     let (internal_desc, internal_keymap, _) = match desc_type.to_lowercase().as_str() {
         "pkh" => Bip44(xprv, KeychainKind::Internal).build(network)?,
         "sh" => Bip49(xprv, KeychainKind::Internal).build(network)?,
-        "wpkh" | "wsh" => Bip84(xprv, KeychainKind::Internal).build(network)?,
+        "wpkh" => Bip84(xprv, KeychainKind::Internal).build(network)?,
+        "wsh" => SingleKeyWsh(xprv, KeychainKind::Internal).build(network)?,
         "tr" => Bip86(xprv, KeychainKind::Internal).build(network)?,
         _ => {
             return Err(Error::Generic(format!(
@@ -477,5 +507,91 @@ mod multipath_tests {
         assert_eq!(T::from_derivation_path(&p("m/48'/1'/0'/2'")), None);
         // BIP-43: an unhardened purpose is not a standard path.
         assert_eq!(T::from_derivation_path(&p("m/84/1/0")), None);
+    }
+}
+
+#[cfg(test)]
+mod private_descriptor_tests {
+    use super::*;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// Returns the four descriptors as (public external, public internal, private external, private internal).
+    fn all_descriptors(result: &DescriptorResult) -> [&str; 4] {
+        let public = result.public_descriptors.as_ref().unwrap();
+        let private = result.private_descriptors.as_ref().unwrap();
+        [
+            &public.external,
+            &public.internal,
+            &private.external,
+            &private.internal,
+        ]
+    }
+
+    #[test]
+    fn wsh_from_mnemonic_builds_wsh_descriptors() {
+        let result = generate_descriptor_from_mnemonic(MNEMONIC, NetworkKind::Test, "wsh").unwrap();
+
+        for descriptor in all_descriptors(&result) {
+            assert!(
+                descriptor.starts_with("wsh(pk("),
+                "expected wsh(pk(...)), got {descriptor}"
+            );
+        }
+        let public = result.public_descriptors.unwrap();
+        Descriptor::<DescriptorPublicKey>::from_str(&public.external).unwrap();
+        Descriptor::<DescriptorPublicKey>::from_str(&public.internal).unwrap();
+    }
+
+    #[test]
+    fn wsh_from_xprv_builds_wsh_descriptors() {
+        let seed = Mnemonic::parse_in(Language::English, MNEMONIC)
+            .unwrap()
+            .to_seed("");
+        let xprv = Xpriv::new_master(NetworkKind::Test, &seed).unwrap();
+
+        let result = generate_descriptors("wsh", &xprv.to_string(), NetworkKind::Test).unwrap();
+
+        for descriptor in all_descriptors(&result) {
+            assert!(
+                descriptor.starts_with("wsh(pk("),
+                "expected wsh(pk(...)), got {descriptor}"
+            );
+        }
+    }
+
+    #[test]
+    fn wsh_uses_same_key_and_path_as_wpkh() {
+        let strip = |d: &str| d.split('#').next().unwrap().to_string();
+        let wsh = generate_descriptor_from_mnemonic(MNEMONIC, NetworkKind::Test, "wsh").unwrap();
+        let wpkh = generate_descriptor_from_mnemonic(MNEMONIC, NetworkKind::Test, "wpkh").unwrap();
+
+        let wsh_ext = strip(&wsh.public_descriptors.unwrap().external);
+        let wpkh_ext = strip(&wpkh.public_descriptors.unwrap().external);
+        let key = wpkh_ext
+            .strip_prefix("wpkh(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap();
+
+        assert_eq!(wsh_ext, format!("wsh(pk({key}))"));
+    }
+
+    #[test]
+    fn other_types_keep_their_template_output() {
+        for (desc_type, prefix) in [
+            ("pkh", "pkh("),
+            ("sh", "sh(wpkh("),
+            ("wpkh", "wpkh("),
+            ("tr", "tr("),
+        ] {
+            let result =
+                generate_descriptor_from_mnemonic(MNEMONIC, NetworkKind::Test, desc_type).unwrap();
+            for descriptor in all_descriptors(&result) {
+                assert!(
+                    descriptor.starts_with(prefix),
+                    "{desc_type}: expected {prefix}..., got {descriptor}"
+                );
+            }
+        }
     }
 }
